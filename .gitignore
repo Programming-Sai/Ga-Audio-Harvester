@@ -208,3 +208,6 @@ __marimo__/
 debug_downloads
 .vscode/
 assets/*
+t_out
+media
+output
