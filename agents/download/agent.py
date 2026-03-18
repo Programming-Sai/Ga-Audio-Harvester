@@ -31,7 +31,7 @@ import spade
 import spade.agent
 from dotenv import load_dotenv
 
-from agents.download.behaviours import QueueConsumerBehaviour
+from agents.download.behaviours import QueueConsumerBehaviour, MessageReceiverBehaviour
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -113,6 +113,13 @@ class DownloadAgent(spade.agent.Agent):
         # pause flag — checked by QueueConsumerBehaviour
         self.paused = False
 
+        # XMPP targets (Phase B)
+        self.resilience_jid = os.getenv("RESILIENCE_JID") or None
+        self.discovery_done = False
+
+        # job cache for retries (url -> Job)
+        self.job_cache: dict[str, Job] = {}
+
         # internal state
         self.download_state = DownloadInternalState()
 
@@ -130,6 +137,7 @@ class DownloadAgent(spade.agent.Agent):
         self.all_done_event  = asyncio.Event()
         self.download_state.state_flag = "running"
         self.add_behaviour(QueueConsumerBehaviour())
+        self.add_behaviour(MessageReceiverBehaviour())
 
     # ── PUBLIC API ────────────────────────────────────────────────────────
 
@@ -138,6 +146,24 @@ class DownloadAgent(spade.agent.Agent):
         self.pending_queue.put_nowait(job)
         with self.download_state.lock:
             self.download_state.total += 1
+        if getattr(job, "url", None):
+            self.job_cache[job.url] = job
+
+    def make_job(
+        self,
+        url: str,
+        source: str,
+        query_key: str,
+        title: str = "",
+        output_dir: str = "",
+    ) -> Job:
+        return Job(
+            url=url,
+            source=source,
+            query_key=query_key,
+            title=title,
+            output_dir=output_dir,
+        )
 
     def add_jobs(self, jobs: list):
         """Add multiple jobs at once."""
@@ -170,6 +196,7 @@ class DownloadAgent(spade.agent.Agent):
             source=job.source,
             status="OK" if ok else "ERR",
         )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,3 +301,10 @@ if __name__ == "__main__":
         asyncio.run(_run_standalone())
     except KeyboardInterrupt:
         print("\n[DownloadAgent] interrupted by user.")
+@dataclass
+class Job:
+    url:        str
+    source:     str
+    query_key:  str
+    title:      str = ""
+    output_dir: str = ""

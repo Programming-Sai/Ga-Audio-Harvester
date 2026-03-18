@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from agents.resilience.behaviours import (
     HeartbeatBehaviour,
     StallDetectorBehaviour,
+    MessageReceiverBehaviour,
     HEARTBEAT_PERIOD,
     STALL_PERIOD,
 )
@@ -52,14 +53,15 @@ class ResilienceInternalState:
     log:             deque = field(default_factory=lambda: deque(maxlen=500))
     retries:         int   = 0
     failures:        int   = 0
+    errors:          int   = 0
     uptime_pct:      float = 100.0
     heartbeat_count: int   = 0
     last_known_errors: int = 0
 
-    # per-slot stall tracking (used by StallDetectorBehaviour)
-    slot_last_pct:     dict = field(default_factory=dict)
-    slot_last_move:    dict = field(default_factory=dict)
-    slot_stall_warned: set  = field(default_factory=set)
+    # per-job stall tracking (used by StallDetectorBehaviour)
+    job_last_pct:     dict = field(default_factory=dict)
+    job_last_move:    dict = field(default_factory=dict)
+    job_stall_warned: set  = field(default_factory=set)
 
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -87,11 +89,17 @@ class ResilienceAgent(spade.agent.Agent):
     ):
         super().__init__(jid, password, verify_security=verify_security)
 
-        # references to sibling agents (set via watch())
+        # XMPP target (Phase B)
+        self.download_jid = os.getenv("DOWNLOAD_JID") or None
+
+        # references to sibling agents (Phase A only)
         self.watched_agents: dict = {}
 
         # internal state
         self.resilience_state = ResilienceInternalState()
+
+        # completion signal (Phase B)
+        self.all_done_event: asyncio.Event = asyncio.Event()
 
     # ── SPADE LIFECYCLE ───────────────────────────────────────────────────
 
@@ -104,6 +112,7 @@ class ResilienceAgent(spade.agent.Agent):
 
         self.add_behaviour(HeartbeatBehaviour(period=HEARTBEAT_PERIOD))
         self.add_behaviour(StallDetectorBehaviour(period=STALL_PERIOD))
+        self.add_behaviour(MessageReceiverBehaviour())
 
     # ── PUBLIC API ────────────────────────────────────────────────────────
 
@@ -130,6 +139,7 @@ class ResilienceAgent(spade.agent.Agent):
         with self.resilience_state.lock:
             self.resilience_state.log.append((tag, msg))
         logger.info("RESILIENCE %s %s", tag, msg)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -33,6 +33,31 @@ logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
 
+def _enable_xmpp_xml_logging(only_messages: bool = False):
+    """
+    Print raw XMPP XML stanzas with spacing for readability.
+    Enable via env var: PRINT_XMPP=1
+    Set PRINT_XMPP=messages to show only <message> stanzas.
+    """
+    xml_logger = logging.getLogger("slixmpp.xmlstream")
+    xml_logger.setLevel(logging.DEBUG)
+    xml_logger.propagate = False
+
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("\n%(message)s\n"))
+
+    if only_messages:
+        class _MessageOnlyFilter(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                msg = record.getMessage()
+                return "<message" in msg or msg.strip().startswith("SEND: <message") or msg.strip().startswith("RECV: <message")
+        handler.addFilter(_MessageOnlyFilter())
+
+    xml_logger.handlers.clear()
+    xml_logger.addHandler(handler)
+
+
 async def run_pipeline(
     query_file:   str | Path,
     output_dir:   str | Path = "./output",
@@ -80,10 +105,6 @@ async def run_pipeline(
     await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
     await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
 
-    # wire resilience to watch the others
-    res.watch("discovery", disc)
-    res.watch("download",  dl)
-
     logger.info("All agents running. Pipeline in progress...")
 
     # ── DISCOVERY PHASE ───────────────────────────────────────────────
@@ -104,7 +125,6 @@ async def run_pipeline(
         return
 
     # ── DOWNLOAD PHASE ────────────────────────────────────────────────
-    dl.add_jobs(jobs)
     logger.info(
         "Download started — %d jobs  workers:%d  retries:%d",
         len(jobs), worker_slots, retries
@@ -193,6 +213,10 @@ def main():
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     )
+
+    px = os.getenv("PRINT_XMPP")
+    if px:
+        _enable_xmpp_xml_logging(only_messages=(px.lower() == "messages"))
 
     args = parse_args()
 

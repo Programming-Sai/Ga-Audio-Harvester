@@ -95,6 +95,7 @@ class DiscoveryAgent(spade.agent.Agent):
         output_dir: str | Path = "./output",
         max_items: Optional[dict] = None,
         verify_security: bool = False,
+        download_jid: Optional[str] = None,
     ):
         super().__init__(jid, password, verify_security=verify_security)
 
@@ -112,6 +113,9 @@ class DiscoveryAgent(spade.agent.Agent):
 
         # internal state (read by TUI bridge in Phase C)
         self.discovery_state = DiscoveryInternalState()
+
+        # target JID for XMPP job dispatch (Phase B)
+        self.download_jid = download_jid or os.getenv("DOWNLOAD_JID") or None
 
         # created in setup() once the event loop is running
         self.resolution_done: asyncio.Event = None  # type: ignore
@@ -167,6 +171,8 @@ class DiscoveryAgent(spade.agent.Agent):
         )
         with self.job_lock:
             self.job_queue.append(job)
+        return job
+
 
     def get_jobs(self) -> list[Job]:
         """Return a snapshot of the current job queue."""

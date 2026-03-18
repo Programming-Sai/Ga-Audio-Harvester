@@ -22,6 +22,24 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import spade.behaviour
+from spade.message import Message
+
+from agents.shared.ontology import (
+    ONTOLOGY,
+    MSG_JOB_ENQUEUE,
+    MSG_DISCOVERY_DONE,
+    MSG_RETRY,
+    MSG_PAUSE,
+    MSG_RESUME,
+    DownloadProgressMsg,
+    DownloadFinishedMsg,
+    DownloadFailedMsg,
+    DownloadAllDoneMsg,
+    INFORM,
+    decode,
+    msg_type,
+    encode,
+)
 
 if TYPE_CHECKING:
     from .agent import DownloadAgent
@@ -102,6 +120,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
         """Run yt-dlp in a thread, map progress hook → worker slot."""
         ds    = agent.download_state
         start = time.time()
+        loop  = asyncio.get_running_loop()
 
         with ds.lock:
             w = ds.workers[slot_idx]
@@ -112,6 +131,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             "[START]",
             f"[W{slot_idx+1}] {(job.title or job.url)[:50]}"
         )
+        await self._send_progress(agent, job.url, pct=0.0)
 
         # ── PROGRESS HOOK ─────────────────────────────────────────────
         def _progress(ev: dict):
@@ -125,11 +145,22 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
                 elif status == "finished":
                     w.pct   = 100.0
 
+            if status == "downloading":
+                pct = float(ev.get("progress", 0.0))
+                speed = float(ev.get("speed") or 0.0)
+                eta = float(ev.get("eta") or 0.0)
+                filename = ev.get("filename") or ""
+                loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    self._send_progress(agent, job.url, pct, speed=speed, eta=eta, filename=filename),
+                )
+
         # ── RUN IN THREAD ─────────────────────────────────────────────
         from download_layer.core import download_video
 
         out_dir = Path(job.output_dir) if job.output_dir else agent.output_dir
 
+        failed_sent = False
         try:
             ok = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -145,13 +176,18 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
         except asyncio.TimeoutError:
             ok = False
             agent._log("[ERR]", f"[W{slot_idx+1}] timed out after 300s: {job.url[:50]}")
+            await self._send_failed(agent, job.url, reason="timeout")
+            failed_sent = True
         except Exception as exc:
             ok = False
             agent._log("[ERR]", f"[W{slot_idx+1}] exception: {exc}")
+            await self._send_failed(agent, job.url, reason=str(exc))
+            failed_sent = True
 
         elapsed = time.time() - start
 
         # ── UPDATE STATE ──────────────────────────────────────────────
+        finished_mb = 0
         with ds.lock:
             w    = ds.workers[slot_idx]
             name = w.name
@@ -164,6 +200,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
                 est_mb = int((w.speed or 0) * elapsed)
                 ds.total_mb += est_mb
                 cd = agent._make_completed(job, ok=True, size_mb=est_mb)
+                finished_mb = est_mb
             else:
                 ds.errors += 1
                 tag = "[ERR]"
@@ -180,6 +217,10 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             ds.eta = (rem / max(len(active_speeds), 1)) * 5 if active_speeds else 0
 
         agent._log(tag, msg)
+        if ok:
+            await self._send_finished(agent, job.url, size_mb=finished_mb)
+        elif not failed_sent:
+            await self._send_failed(agent, job.url, reason="failed")
 
         # check if all done
         with ds.lock:
@@ -189,4 +230,88 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             with ds.lock:
                 ds.state_flag = "done"
             agent.all_done_event.set()
-            agent._log("[DONE]", f"All downloads complete — {ds.done} OK  {ds.errors} ERR")
+            agent._log("[DONE]", f"All downloads complete ? {ds.done} OK  {ds.errors} ERR")
+            await self._send_all_done(agent, ds.done, ds.errors, ds.total_mb)
+
+    async def _send_progress(self, agent: DownloadAgent, url: str, pct: float, speed: float = 0.0, eta: float = 0.0, filename: str = ""):
+        if not agent.resilience_jid:
+            return
+        msg = Message(to=agent.resilience_jid)
+        msg.set_metadata("ontology", ONTOLOGY)
+        msg.set_metadata("performative", INFORM)
+        msg.body = encode(DownloadProgressMsg(
+            url=url, pct=pct, speed=speed, eta=eta, filename=filename
+        ))
+        await self.send(msg)
+
+    async def _send_finished(self, agent: DownloadAgent, url: str, filename: str = "", size_mb: int = 0):
+        if not agent.resilience_jid:
+            return
+        msg = Message(to=agent.resilience_jid)
+        msg.set_metadata("ontology", ONTOLOGY)
+        msg.set_metadata("performative", INFORM)
+        msg.body = encode(DownloadFinishedMsg(
+            url=url, filename=filename, size_mb=size_mb
+        ))
+        await self.send(msg)
+
+    async def _send_failed(self, agent: DownloadAgent, url: str, reason: str = "", attempt: int = 0):
+        if not agent.resilience_jid:
+            return
+        msg = Message(to=agent.resilience_jid)
+        msg.set_metadata("ontology", ONTOLOGY)
+        msg.set_metadata("performative", INFORM)
+        msg.body = encode(DownloadFailedMsg(
+            url=url, reason=reason, attempt=attempt
+        ))
+        await self.send(msg)
+
+    async def _send_all_done(self, agent: DownloadAgent, done: int, errors: int, total_mb: int):
+        if not agent.resilience_jid:
+            return
+        msg = Message(to=agent.resilience_jid)
+        msg.set_metadata("ontology", ONTOLOGY)
+        msg.set_metadata("performative", INFORM)
+        msg.body = encode(DownloadAllDoneMsg(
+            done=done, errors=errors, total_mb=total_mb
+        ))
+        await self.send(msg)
+
+class MessageReceiverBehaviour(spade.behaviour.CyclicBehaviour):
+    """
+    Receives XMPP messages from Discovery (jobs) and Resilience (retry/pause/resume).
+    """
+
+    async def run(self):
+        agent: DownloadAgent = self.agent
+        msg = await self.receive(timeout=1)
+        if not msg:
+            return
+        if msg.metadata.get("ontology") != ONTOLOGY:
+            return
+
+        body = msg.body or ""
+        mtype = msg_type(body)
+        data = decode(body)
+
+        if mtype == MSG_JOB_ENQUEUE:
+            job = agent.make_job(
+                url=data.get("url", ""),
+                source=data.get("source", ""),
+                query_key=data.get("query_key", ""),
+                title=data.get("title", ""),
+                output_dir=data.get("output_dir", ""),
+            )
+            agent.add_job(job)
+        elif mtype == MSG_DISCOVERY_DONE:
+            agent.discovery_done = True
+        elif mtype == MSG_RETRY:
+            url = data.get("url", "")
+            job = agent.job_cache.get(url)
+            if job:
+                await agent.pending_queue.put(job)
+        elif mtype == MSG_PAUSE:
+            agent.pause()
+        elif mtype == MSG_RESUME:
+            agent.resume()
+

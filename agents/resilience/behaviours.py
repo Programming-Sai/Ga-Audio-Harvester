@@ -3,23 +3,14 @@ agents/resilience/behaviours.py
 ================================
 SPADE behaviours for the ResilienceAgent.
 
-Behaviour map (Prometheus capability → SPADE behaviour):
-  MonitorPipeline  → HeartbeatBehaviour   (PeriodicBehaviour, 10s)
-    Checks that Discovery and Download agents are alive and
-    progressing.  Detects stalls and emits warnings.
+Behaviour map (Prometheus capability ? SPADE behaviour):
+  MonitorPipeline  ? HeartbeatBehaviour   (PeriodicBehaviour, 10s)
+    Logs overall pipeline health and error growth.
 
-  WatchDownloads   → StallDetectorBehaviour  (PeriodicBehaviour, 5s)
-    Watches each active worker slot for zero-progress stalls.
-    If a slot hasn't moved in STALL_THRESHOLD seconds, decides
-    whether to retry the job or skip it based on error type:
-
-    RETRYABLE  — slot made some progress (pct > 0) before stalling.
-                 This suggests a transient network issue. Job is
-                 re-queued into agent.pending_queue.
-
-    NOT RETRYABLE — slot stalled at exactly 0% (HTTP 403, bad path,
-                    unavailable video). Retrying is pointless.
-                    Logged as skipped.
+  WatchDownloads   ? StallDetectorBehaviour  (PeriodicBehaviour, 5s)
+    Watches each active job for zero-progress stalls.
+    If a job hasn't moved in STALL_THRESHOLD seconds, decides
+    whether to retry the job based on error type.
 """
 
 from __future__ import annotations
@@ -29,6 +20,20 @@ import time
 from typing import TYPE_CHECKING
 
 import spade.behaviour
+from spade.message import Message
+
+from agents.shared.ontology import (
+    REQUEST,
+    RetryMsg,
+    encode,
+    ONTOLOGY,
+    MSG_DL_PROGRESS,
+    MSG_DL_FINISHED,
+    MSG_DL_FAILED,
+    MSG_DL_ALL_DONE,
+    decode,
+    msg_type,
+)
 
 if TYPE_CHECKING:
     from .agent import ResilienceAgent
@@ -41,36 +46,75 @@ STALL_PERIOD     = 5    # seconds between stall checks
 MAX_RETRIES      = 3    # maximum retries per job before giving up
 
 
-class HeartbeatBehaviour(spade.behaviour.PeriodicBehaviour):
+class MessageReceiverBehaviour(spade.behaviour.CyclicBehaviour):
     """
-    Percept  : state_flag of watched agents
-    Goal     : confirm all agents are progressing
-    Action   : log status, count uptime ticks, warn on new errors
+    Receive download progress from DownloadAgent over XMPP.
+    Updates internal progress maps and error counters.
     """
 
     async def run(self):
         agent: ResilienceAgent = self.agent
         rs = agent.resilience_state
 
-        disc = agent.watched_agents.get("discovery")
-        dl   = agent.watched_agents.get("download")
+        msg = await self.receive(timeout=1)
+        if not msg:
+            return
+        if msg.metadata.get("ontology") != ONTOLOGY:
+            return
 
-        disc_status = disc.discovery_state.state_flag.upper() if disc else "—"
-        dl_status   = dl.download_state.state_flag.upper()    if dl   else "—"
+        body = msg.body or ""
+        mtype = msg_type(body)
+        data = decode(body)
+        now = time.time()
 
-        if dl:
-            with dl.download_state.lock:
-                errs = dl.download_state.errors
+        if mtype == MSG_DL_PROGRESS:
+            url = data.get("url", "")
+            pct = float(data.get("pct", 0.0))
+            with rs.lock:
+                last_pct = rs.job_last_pct.get(url, -1)
+                if pct != last_pct:
+                    rs.job_last_pct[url] = pct
+                    rs.job_last_move[url] = now
+                    if url in rs.job_stall_warned:
+                        rs.job_stall_warned.discard(url)
+                        agent._log("[OK]", f"{url[:30]} resumed ? stall cleared")
+        elif mtype == MSG_DL_FINISHED:
+            url = data.get("url", "")
+            with rs.lock:
+                rs.job_last_pct.pop(url, None)
+                rs.job_last_move.pop(url, None)
+                rs.job_stall_warned.discard(url)
+        elif mtype == MSG_DL_FAILED:
+            url = data.get("url", "")
+            with rs.lock:
+                rs.errors += 1
+            agent._log("[WARN]", f"Download failed: {url[:40]}")
+        elif mtype == MSG_DL_ALL_DONE:
+            with rs.lock:
+                rs.state_flag = "done"
+            agent._log("[DONE]", "Pipeline complete ? download all done")
+            agent.all_done_event.set()
 
-            if errs > rs.last_known_errors:
-                delta = errs - rs.last_known_errors
-                rs.last_known_errors = errs
-                agent._log(
-                    "[WARN]",
-                    f"{delta} new download error(s) — total: {errs}"
-                )
 
-        agent._log("[HBEAT]", f"DISC:{disc_status}  DL:{dl_status}  uptime:100%")
+class HeartbeatBehaviour(spade.behaviour.PeriodicBehaviour):
+    """
+    Logs heartbeat and error counts based on XMPP updates.
+    """
+
+    async def run(self):
+        agent: ResilienceAgent = self.agent
+        rs = agent.resilience_state
+
+        with rs.lock:
+            active = len(rs.job_last_pct)
+            errs = rs.errors
+
+        if errs > rs.last_known_errors:
+            delta = errs - rs.last_known_errors
+            rs.last_known_errors = errs
+            agent._log("[WARN]", f"{delta} new download error(s) ? total: {errs}")
+
+        agent._log("[HBEAT]", f"DL:RUNNING  active:{active}  errors:{errs}")
 
         with rs.lock:
             rs.heartbeat_count += 1
@@ -78,104 +122,69 @@ class HeartbeatBehaviour(spade.behaviour.PeriodicBehaviour):
 
 class StallDetectorBehaviour(spade.behaviour.PeriodicBehaviour):
     """
-    Percept  : worker slot pct + job values over time
-    Goal     : detect stalls, retry if transient, skip if permanent
+    Detects stalled downloads based on XMPP progress updates.
     Decision logic:
-      - pct > 0 at stall time  → transient, re-queue job (up to MAX_RETRIES)
-      - pct == 0 at stall time → permanent (403 / bad path), skip
+      - pct > 0 at stall time  ? transient, retry (up to MAX_RETRIES)
+      - pct == 0 at stall time ? permanent, skip
     """
 
+
+    async def _send_retry(self, agent, url: str, reason: str = "stall"):
+        if not agent.download_jid:
+            return
+        msg = Message(to=agent.download_jid)
+        msg.set_metadata("ontology", ONTOLOGY)
+        msg.set_metadata("performative", REQUEST)
+        msg.body = encode(RetryMsg(url=url, reason=reason))
+        await self.send(msg)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # track retry counts per job URL to enforce MAX_RETRIES
         self._retry_counts: dict[str, int] = {}
 
     async def run(self):
         agent: ResilienceAgent = self.agent
         rs = agent.resilience_state
 
-        dl = agent.watched_agents.get("download")
-        if not dl:
-            return
-
         now = time.time()
 
-        with dl.download_state.lock:
-            workers = [
-                (w.idx, w.name, w.pct, w.active, w.job)
-                for w in dl.download_state.workers
-            ]
+        with rs.lock:
+            items = list(rs.job_last_pct.items())
+            last_moves = dict(rs.job_last_move)
+            warned = set(rs.job_stall_warned)
 
-        for idx, name, pct, active, job in workers:
-            if not active:
-                # clear stall record if slot went idle
-                rs.slot_last_pct.pop(idx, None)
-                rs.slot_last_move.pop(idx, None)
-                rs.slot_stall_warned.discard(idx)
+        for url, pct in items:
+            last_move = last_moves.get(url, now)
+            stall_secs = now - last_move
+            if stall_secs < STALL_THRESHOLD or url in warned:
                 continue
 
-            last_pct  = rs.slot_last_pct.get(idx, -1)
-            last_move = rs.slot_last_move.get(idx, now)
+            with rs.lock:
+                rs.job_stall_warned.add(url)
 
-            if pct != last_pct:
-                # progress detected — clear any stall warning
-                rs.slot_last_pct[idx]  = pct
-                rs.slot_last_move[idx] = now
-                if idx in rs.slot_stall_warned:
-                    rs.slot_stall_warned.discard(idx)
-                    agent._log("[OK]", f"W{idx} resumed — stall cleared")
+            retry_count = self._retry_counts.get(url, 0)
+
+            if pct > 0 and retry_count < MAX_RETRIES:
+                self._retry_counts[url] = retry_count + 1
+                with rs.lock:
+                    rs.retries += 1
+                agent._log(
+                    "[RETRY]",
+                    f"stall at {pct:.0f}% ? re-queuing {url[:30]} (attempt {retry_count + 1}/{MAX_RETRIES})"
+                )
+                await self._send_retry(agent, url, reason="stall")
+
+            elif pct > 0 and retry_count >= MAX_RETRIES:
+                with rs.lock:
+                    rs.failures += 1
+                agent._log(
+                    "[FAIL]",
+                    f"max retries ({MAX_RETRIES}) exhausted: {url[:30]}"
+                )
+
             else:
-                stall_secs = now - last_move
-                if stall_secs < STALL_THRESHOLD or idx in rs.slot_stall_warned:
-                    continue
-
-                # ── STALL DETECTED ────────────────────────────────────
-                rs.slot_stall_warned.add(idx)
-
-                if job is None:
-                    # no job reference available — can't retry
-                    agent._log("[WARN]", f"W{idx} stall >{STALL_THRESHOLD}s — no job ref, skipping")
-                    continue
-
-                job_key = job.url
-                retry_count = self._retry_counts.get(job_key, 0)
-
-                if pct > 0 and retry_count < MAX_RETRIES:
-                    # ── RETRYABLE: made some progress, transient issue ──
-                    self._retry_counts[job_key] = retry_count + 1
-                    with rs.lock:
-                        rs.retries += 1
-
-                    agent._log(
-                        "[RETRY]",
-                        f"W{idx} stall at {pct:.0f}% — re-queuing: "
-                        f"{(job.title or job.url)[:30]}  "
-                        f"(attempt {retry_count + 1}/{MAX_RETRIES})"
-                    )
-
-                    # re-queue the job — total stays the same since
-                    # it was already counted when first added
-                    dl.pending_queue.put_nowait(job)
-
-                elif pct > 0 and retry_count >= MAX_RETRIES:
-                    # ── EXHAUSTED RETRIES ─────────────────────────────
-                    with rs.lock:
-                        rs.failures += 1
-                    agent._log(
-                        "[FAIL]",
-                        f"W{idx} — max retries ({MAX_RETRIES}) exhausted: "
-                        f"{(job.title or job.url)[:30]}"
-                    )
-
-                else:
-                    # ── NOT RETRYABLE: stalled at 0% ──────────────────
-                    # 403 Forbidden, bad path, unavailable video etc.
-                    # Retrying the same URL will produce the same result.
-                    with rs.lock:
-                        rs.retries += 1  # count it but don't re-queue
-                    agent._log(
-                        "[SKIP]",
-                        f"W{idx} stall at 0% — not retrying "
-                        f"(likely 403/bad path): "
-                        f"{(job.title or job.url)[:30]}"
-                    )
+                with rs.lock:
+                    rs.retries += 1
+                agent._log(
+                    "[SKIP]",
+                    f"stall at 0% ? not retrying (likely 403/bad path): {url[:30]}"
+                )
