@@ -1,101 +1,118 @@
 # Ga-Audio-Harvester
 
-Automated pipeline to search, batch-download, and organize Ga-language audio content from YouTube for local curation and listening.
+Ga-Audio-Harvester is a multi-agent YouTube audio curator for Ga-language content. It blends an agentic pipeline (Discovery, Download, Resilience) with a practical CLI, making it useful for language-resource curation, experimental agent architectures, and reproducible academic work.
 
----
+**Abstract**
+This project treats audio collection as a coordinated multi-agent system: one agent resolves inputs into actionable URLs, another executes downloads with bounded concurrency, and a watchdog agent monitors health and failure signals. The system accepts search queries, channels, playlists, and direct video URLs, then curates the resulting audio into a consistent output layout for downstream analysis or listening.
 
-## Overview
+**Project Goals**
 
-Ga-Audio-Harvester is designed to facilitate the collection of Ga-language audio material from YouTube. The primary goal is to enable raw listening and fluency practice without focusing on grammar or structured exercises. This version (v1) provides a command-line interface (CLI) for managing downloads efficiently.
+- Build a reproducible, agent-driven pipeline for Ga-language audio curation.
+- Demonstrate a modular multi-agent architecture with explicit roles and shared ontology.
+- Keep the workflow accessible to researchers and practitioners through a CLI entry point.
 
----
+**System Overview**
 
-## Features
+- `agents/`: SPADE agents implementing Discovery (resolve inputs), Download (execute jobs), and Resilience (monitor health) with a shared ontology.
+- `input_layer`: parses query files, merges CLI and file-based config, and feeds the agent pipeline.
+- `download_layer`: runs `yt-dlp` downloads, applies retries, and structures outputs by source type.
+- `assets/input/queries.txt`: example query file with search terms and YouTube URLs.
 
-- Batch-download audio from channels, playlists, or search queries.
-- CLI-based configuration of concurrency and download limits.
-- Basic dashboard displaying ongoing download progress.
-- Automatic handling of network interruptions; downloads resume after pauses.
-- Configurable output structure and file naming via `config.json` or CLI arguments.
+**How It Works (Agentic Flow)**
 
----
+1. The Discovery agent ingests a query file and classifies each line as search, channel, playlist, or single video.
+2. It resolves each query into concrete download jobs (URLs + target folders).
+3. The Download agent consumes the job queue with bounded worker slots and executes `yt-dlp` audio extraction.
+4. The Resilience agent observes health signals and records retries/failures.
+5. Curated audio is written into type-specific folders under the output directory.
 
-## Limitations
+**Quick Start**
+Requirements:
 
-- Text-based user interface (TUI) is minimal and limited in features.
-- Concurrency is currently applied at the query level only.
-- Downloads may be slower for large playlists or channels due to query-level concurrency.
-- Some downloads may fail if network issues occur mid-stream, though successful downloads are preserved.
+- Python 3.12 or newer.
+- `yt-dlp` installed (Python package and CLI).
+- `ffmpeg` available on PATH for audio extraction.
 
----
-
-## Installation
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/Programming-Sai/Ga-Audio-Harvester.git
-   ```
-
-2. Ensure Python 3.12+ is installed.
-3. Install required packages:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Ensure `ffmpeg` is installed and available in your system PATH.
-
----
-
-## Usage
-
-Prepare an input file containing URLs or search queries (one per line).
-
-Run the main CLI:
+Install dependencies:
 
 ```bash
-python main.py -i <input_file> -o <output_dir> config [options]
+pip install -r requirements.txt
 ```
 
-## CLI Options
-
-#### Global options
-
-- `-i INPUT, --input INPUT` : Input file with URLs or search queries.
-- `-o OUTPUT, --output OUTPUT` : Output directory.
-- `-h, --help` : Show help message and exit.
-
-#### Config subcommand
-
-Use `config` to specify download parameters:
+Run the CLI with the sample inputs:
 
 ```bash
-python main.py config -h
+python main.py -i assets/input/queries.txt -o output config -C 2 -s 5 -p 10 -c 10
 ```
 
-Available options:
+**CLI Usage**
+Entry point: `main.py` with the `config` subcommand (single-process runner).
 
-- `-r RETRIES, --retries RETRIES` : Number of retries per download.
-- `-y YT_OUTPUT, --yt-output YT_OUTPUT` : Output filename template for downloads.
-- `-C CONCURRENCY, --concurrency CONCURRENCY` : Maximum concurrent queries.
-- `-a ALL, --all ALL` : Maximum items for "all" queries.
-- `-s SEARCH, --search SEARCH` : Maximum items per search query.
-- `-p PLAYLIST, --playlist PLAYLIST` : Maximum items per playlist.
-- `-c CHANNEL, --channel CHANNEL` : Maximum items per channel.
+Global options:
 
----
+- `-i`, `--input`: Path to query file.
+- `-o`, `--output`: Output directory root.
 
-## Output Structure
+Config options:
 
+- `-r`, `--retries`: Retry count per download.
+- `-y`, `--yt-output`: `yt-dlp` output template.
+- `-C`, `--concurrency`: Max concurrent queries.
+- `-a`, `--all`: Max items for catch-all queries.
+- `-s`, `--search`: Max items per search query.
+- `-p`, `--playlist`: Max items per playlist.
+- `-c`, `--channel`: Max items per channel.
+
+Example:
+
+```bash
+python main.py -i assets/input/queries.txt -o output config -r 2 -C 2 -s 10 -p 20 -c 20
+```
+
+**Multi-Agent Pipeline (SPADE)**
+The agent pipeline is the primary research path. It runs Discovery, Download, and Resilience as autonomous agents and is designed to evolve toward full XMPP message passing.
+
+Run the pipeline:
+
+```bash
+python -m agents.pipeline --input assets/input/queries.txt --output output --workers 4 --search 10 --channel 10 --playlist 20
+```
+
+Environment variables (examples in `.env`):
+
+- `DISCOVERY_JID`, `DISCOVERY_PASSWORD`
+- `DOWNLOAD_JID`, `DOWNLOAD_PASSWORD`
+- `RESILIENCE_JID`, `RESILIENCE_PASSWORD`
+
+**Input Format**
+Each line in the input file is either:
+
+- A plain text search query.
+- A YouTube video URL.
+- A YouTube channel URL (including `@handle`).
+- A YouTube playlist URL.
+
+**Output Layout**
 Downloads are organized under the output directory:
 
 ```
 output/
-├─ channels/
-├─ playlists/
-├─ search/
-└─ single_videos/
+|-- channels/
+|-- playlists/
+|-- search/
+|-- single_videos/
 ```
 
-Files are named using the configured `yt-dlp` template, which includes title and ID to prevent collisions.
+**Logging**
+The CLI initializes rotating logs in `logs/ga_audio_harvester.log`. Console output is kept compact for interactive runs.
+
+**Project Structure**
+
+- `main.py`: CLI entry point.
+- `input_layer/`: config parsing and query loading.
+- `download_layer/`: download orchestration and `yt-dlp` integration.
+- `agents/`: SPADE agents and shared message ontology.
+- `assets/input/`: sample query files for quick testing.
+
+**Acknowledgments**
+Built on `yt-dlp` and SPADE, with `ffmpeg` for audio extraction.
