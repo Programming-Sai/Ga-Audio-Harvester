@@ -95,6 +95,9 @@ class DiscoveryAgent(spade.agent.Agent):
         output_dir: str | Path = "./output",
         max_items: Optional[dict] = None,
         verify_security: bool = False,
+        use_xmpp: bool = False,
+        download_jid: Optional[str] = None,
+        xmpp_debug: bool = False,
     ):
         super().__init__(jid, password, verify_security=verify_security)
 
@@ -105,6 +108,9 @@ class DiscoveryAgent(spade.agent.Agent):
             "channel":  10,
             "playlist": 20,
         }
+        self.use_xmpp = use_xmpp
+        self.download_jid = download_jid
+        self.xmpp_debug = xmpp_debug
 
         # populated by ResolveBehaviour
         self.job_queue: list[Job] = []
@@ -132,7 +138,7 @@ class DiscoveryAgent(spade.agent.Agent):
             self.discovery_state.res_log.append((tag, msg))
         logger.info("DISCOVERY %s %s", tag, msg)
 
-    def _enqueue_job(
+    async def _enqueue_job(
         self,
         url: str,
         source: str,
@@ -165,13 +171,17 @@ class DiscoveryAgent(spade.agent.Agent):
                 (folder if source != "direct" else "single_videos")
             ),
         )
+        # always store locally for inspection and TUI mirroring
         with self.job_lock:
             self.job_queue.append(job)
+
+        return job
 
     def get_jobs(self) -> list[Job]:
         """Return a snapshot of the current job queue."""
         with self.job_lock:
             return list(self.job_queue)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

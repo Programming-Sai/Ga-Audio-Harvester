@@ -75,8 +75,13 @@ The agent pipeline is the primary research path. It runs Discovery, Download, an
 Run the pipeline:
 
 ```bash
-python -m agents.pipeline --input assets/input/queries.txt --output output --workers 4 --search 10 --channel 10 --playlist 20
+python -m agents.pipeline --input assets/input/queries.txt --output output --workers 4 --search 10 --channel 10 --playlist 20 --mode xmpp
 ```
+
+Modes:
+
+- `--mode direct`: in-process references between agents (default).
+- `--mode xmpp`: inter-agent messages sent via XMPP.
 
 Environment variables (examples in `.env`):
 

@@ -66,6 +66,15 @@ class CompletedDownload:
 
 
 @dataclass
+class DownloadJob:
+    url:        str
+    source:     str
+    query_key:  str
+    title:      str = ""
+    output_dir: str = ""
+
+
+@dataclass
 class DownloadInternalState:
     """Mirrors tui_v3 DownloadState for Phase C bridge."""
     state_flag: str   = "standby"
@@ -103,12 +112,18 @@ class DownloadAgent(spade.agent.Agent):
         worker_slots: int = WORKER_DEFAULT,
         retries: int = 2,
         verify_security: bool = False,
+        use_xmpp: bool = False,
+        resilience_jid: Optional[str] = None,
+        xmpp_debug: bool = False,
     ):
         super().__init__(jid, password, verify_security=verify_security)
 
         self.output_dir   = Path(output_dir)
         self.worker_slots = max(WORKER_MIN, min(WORKER_MAX, worker_slots))
         self.retries      = retries
+        self.use_xmpp = use_xmpp
+        self.resilience_jid = resilience_jid
+        self.xmpp_debug = xmpp_debug
 
         # pause flag — checked by QueueConsumerBehaviour
         self.paused = False
@@ -120,6 +135,7 @@ class DownloadAgent(spade.agent.Agent):
         self.pending_queue:  asyncio.Queue     = None  # type: ignore
         self.worker_sem:     asyncio.Semaphore = None  # type: ignore
         self.all_done_event: asyncio.Event     = None  # type: ignore
+        self.discovery_done_event: asyncio.Event = None  # type: ignore
 
     # ── SPADE LIFECYCLE ───────────────────────────────────────────────────
 
@@ -128,8 +144,12 @@ class DownloadAgent(spade.agent.Agent):
         self.pending_queue   = asyncio.Queue()
         self.worker_sem      = asyncio.Semaphore(self.worker_slots)
         self.all_done_event  = asyncio.Event()
+        self.discovery_done_event = asyncio.Event()
         self.download_state.state_flag = "running"
         self.add_behaviour(QueueConsumerBehaviour())
+        if self.use_xmpp:
+            from agents.download.behaviours import XmppInboxBehaviour
+            self.add_behaviour(XmppInboxBehaviour())
 
     # ── PUBLIC API ────────────────────────────────────────────────────────
 
@@ -170,6 +190,7 @@ class DownloadAgent(spade.agent.Agent):
             source=job.source,
             status="OK" if ok else "ERR",
         )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

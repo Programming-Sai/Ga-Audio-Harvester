@@ -13,7 +13,7 @@ from pathlib import Path
 from agents.pipeline import run_pipeline
 
 
-def setup_logging():
+def setup_logging(xmpp_log: bool = False):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -21,6 +21,9 @@ def setup_logging():
     # Suppress verbose logs from libraries
     logging.getLogger("slixmpp").setLevel(logging.CRITICAL)
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+    if xmpp_log:
+        logging.getLogger("slixmpp").setLevel(logging.DEBUG)
+        logging.getLogger("slixmpp.xmlstream").setLevel(logging.DEBUG)
 
 
 def parse_args():
@@ -68,12 +71,23 @@ Examples:
         type=int, default=20,
         help="Max videos per playlist (default: 20)"
     )
+    parser.add_argument(
+        "--mode",
+        choices=["direct", "xmpp"],
+        default="direct",
+        help="Agent communication mode (direct or xmpp)"
+    )
+    parser.add_argument(
+        "--xmpp-log",
+        action="store_true",
+        help="Log raw XMPP messages and stanza traffic"
+    )
     return parser.parse_args()
 
 
 def main():
-    setup_logging()
     args = parse_args()
+    setup_logging(args.xmpp_log)
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -98,6 +112,7 @@ def main():
     print(f"Search max : {args.search}")
     print(f"Channel max: {args.channel}")
     print(f"Playlist max: {args.playlist}")
+    print(f"Mode       : {args.mode}")
     print(f"{'='*50}\n")
 
     try:
@@ -107,6 +122,8 @@ def main():
             worker_slots=args.workers,
             retries=args.retries,
             max_items=max_items,
+            comm_mode=args.mode,
+            xmpp_debug=args.xmpp_log,
         ))
     except KeyboardInterrupt:
         print("\n⚠️  Interrupted by user")

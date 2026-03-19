@@ -84,11 +84,17 @@ class ResilienceAgent(spade.agent.Agent):
         jid: str,
         password: str,
         verify_security: bool = False,
+        use_xmpp: bool = False,
+        download_jid: Optional[str] = None,
+        xmpp_debug: bool = False,
     ):
         super().__init__(jid, password, verify_security=verify_security)
 
         # references to sibling agents (set via watch())
         self.watched_agents: dict = {}
+        self.use_xmpp = use_xmpp
+        self.download_jid = download_jid
+        self.xmpp_debug = xmpp_debug
 
         # internal state
         self.resilience_state = ResilienceInternalState()
@@ -102,8 +108,12 @@ class ResilienceAgent(spade.agent.Agent):
         self._log("[INIT]",  "Watchdog process started")
         self._log("[WATCH]", "Monitoring pipeline agents")
 
-        self.add_behaviour(HeartbeatBehaviour(period=HEARTBEAT_PERIOD))
-        self.add_behaviour(StallDetectorBehaviour(period=STALL_PERIOD))
+        if self.use_xmpp:
+            from agents.resilience.behaviours import XmppInboxBehaviour
+            self.add_behaviour(XmppInboxBehaviour())
+        else:
+            self.add_behaviour(HeartbeatBehaviour(period=HEARTBEAT_PERIOD))
+            self.add_behaviour(StallDetectorBehaviour(period=STALL_PERIOD))
 
     # ── PUBLIC API ────────────────────────────────────────────────────────
 

@@ -3,8 +3,8 @@ agents/download/behaviours.py
 ==============================
 SPADE behaviours for the DownloadAgent.
 
-Behaviour map (Prometheus capability → SPADE behaviour):
-  ConsumeQueue  → QueueConsumerBehaviour  (CyclicBehaviour)
+Behaviour map (Prometheus capability â†’ SPADE behaviour):
+  ConsumeQueue  â†’ QueueConsumerBehaviour  (CyclicBehaviour)
     Pulls jobs from agent.pending_queue, runs up to MAX_WORKERS
     concurrent downloads using asyncio.Semaphore, updates
     agent.download_state in real time via the yt-dlp progress hook.
@@ -36,8 +36,8 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
     """
     Percept  : agent.pending_queue  (jobs added by Discovery or directly)
     Goal     : download every job, update agent.download_state
-    Action   : acquire semaphore slot → call download_video() in thread
-               → update worker slot → release semaphore
+    Action   : acquire semaphore slot â†’ call download_video() in thread
+               â†’ update worker slot â†’ release semaphore
     Decision : skip if paused; retry logic handled by ResilienceAgent
     """
 
@@ -70,7 +70,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
         async with agent.worker_sem:
             slot_idx = self._acquire_slot(agent, job)
             if slot_idx is None:
-                # all visible slots occupied — put job back
+                # all visible slots occupied â€” put job back
                 await agent.pending_queue.put(job)
                 return
 
@@ -99,7 +99,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
         return None
 
     async def _download(self, agent: DownloadAgent, job, slot_idx: int):
-        """Run yt-dlp in a thread, map progress hook → worker slot."""
+        """Run yt-dlp in a thread, map progress hook â†’ worker slot."""
         ds    = agent.download_state
         start = time.time()
 
@@ -113,7 +113,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             f"[W{slot_idx+1}] {(job.title or job.url)[:50]}"
         )
 
-        # ── PROGRESS HOOK ─────────────────────────────────────────────
+        # â”€â”€ PROGRESS HOOK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         def _progress(ev: dict):
             status = ev.get("status")
             with ds.lock:
@@ -125,7 +125,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
                 elif status == "finished":
                     w.pct   = 100.0
 
-        # ── RUN IN THREAD ─────────────────────────────────────────────
+        # â”€â”€ RUN IN THREAD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         from download_layer.core import download_video
 
         out_dir = Path(job.output_dir) if job.output_dir else agent.output_dir
@@ -151,7 +151,7 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
 
         elapsed = time.time() - start
 
-        # ── UPDATE STATE ──────────────────────────────────────────────
+        # â”€â”€ UPDATE STATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         with ds.lock:
             w    = ds.workers[slot_idx]
             name = w.name
@@ -181,6 +181,24 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
 
         agent._log(tag, msg)
 
+        if agent.use_xmpp:
+            from agents.shared.ontology import (
+                DownloadFinishedMsg,
+                DownloadFailedMsg,
+            )
+            if ok:
+                await self._send_resilience_msg(DownloadFinishedMsg(
+                    url=job.url,
+                    filename=job.title or "",
+                    size_mb=cd.size_mb,
+                ))
+            else:
+                await self._send_resilience_msg(DownloadFailedMsg(
+                    url=job.url,
+                    reason="download_failed",
+                    attempt=0,
+                ))
+
         # check if all done
         with ds.lock:
             all_done = ds.done + ds.errors >= ds.total and ds.total > 0
@@ -189,4 +207,67 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             with ds.lock:
                 ds.state_flag = "done"
             agent.all_done_event.set()
-            agent._log("[DONE]", f"All downloads complete — {ds.done} OK  {ds.errors} ERR")
+            agent._log("[DONE]", f"All downloads complete â€” {ds.done} OK  {ds.errors} ERR")
+            if agent.use_xmpp:
+                from agents.shared.ontology import DownloadAllDoneMsg
+                await self._send_resilience_msg(DownloadAllDoneMsg(
+                    done=ds.done,
+                    errors=ds.errors,
+                    total_mb=ds.total_mb,
+                ))
+
+    async def _send_resilience_msg(self, msg_dc):
+        agent = self.agent
+        if not agent.use_xmpp or not agent.resilience_jid:
+            return
+        try:
+            from spade.message import Message
+            from agents.shared.ontology import INFORM, ONTOLOGY, encode
+            msg = Message(to=agent.resilience_jid)
+            msg.set_metadata("performative", INFORM)
+            msg.set_metadata("ontology", ONTOLOGY)
+            msg.body = encode(msg_dc)
+            if agent.xmpp_debug:
+                logger.info("XMPP SEND -> %s | %s", agent.resilience_jid, msg.body)
+            await self.send(msg)
+        except Exception as exc:
+            logger.warning("Failed to send to Resilience via XMPP: %s", exc)
+
+
+class XmppInboxBehaviour(spade.behaviour.CyclicBehaviour):
+    """
+    Receives XMPP messages and converts them into local download jobs.
+    """
+
+    async def run(self):
+        agent: DownloadAgent = self.agent
+        msg = await self.receive(timeout=1)
+        if not msg:
+            return
+
+        from agents.shared.ontology import (
+            ONTOLOGY,
+            MSG_JOB_ENQUEUE,
+            MSG_DISCOVERY_DONE,
+            decode,
+        )
+        if msg.get_metadata("ontology") != ONTOLOGY:
+            return
+
+        body = decode(msg.body)
+        if agent.xmpp_debug:
+            logger.info("XMPP RECV <- %s | %s", msg.sender, msg.body)
+        mtype = body.get("type")
+        if mtype == MSG_JOB_ENQUEUE:
+            from agents.download.agent import DownloadJob
+            job = DownloadJob(
+                url=body.get("url", ""),
+                source=body.get("source", ""),
+                query_key=body.get("query_key", ""),
+                title=body.get("title", ""),
+                output_dir=body.get("output_dir", ""),
+            )
+            if job.url:
+                agent.add_job(job)
+        elif mtype == MSG_DISCOVERY_DONE:
+            agent.discovery_done_event.set()

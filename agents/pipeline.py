@@ -4,7 +4,7 @@ agents/pipeline.py
 Top-level pipeline runner for Phase A.
 
 Starts all three agents, wires them together, and runs the full
-pipeline from query file → resolved URLs → downloaded files.
+pipeline from query file ? resolved URLs ? downloaded files.
 
 Usage:
     python -m agents.pipeline
@@ -39,6 +39,8 @@ async def run_pipeline(
     worker_slots: int        = 4,
     retries:      int        = 2,
     max_items:    dict       = None,
+    comm_mode:    str        = "direct",
+    xmpp_debug:   bool       = False,
 ):
     """
     Orchestrate all three agents for one full pipeline run.
@@ -59,34 +61,53 @@ async def run_pipeline(
     res_jid   = os.environ["RESILIENCE_JID"]
     res_pass  = os.environ["RESILIENCE_PASSWORD"]
 
-    # ── CREATE ────────────────────────────────────────────────────────
+    use_xmpp = comm_mode == "xmpp"
+
+    # -- CREATE --------------------------------------------------------
     disc = DiscoveryAgent(
         disc_jid, disc_pass,
         query_file=query_file,
         output_dir=output_dir,
         max_items=max_items,
+        use_xmpp=use_xmpp,
+        download_jid=dl_jid if use_xmpp else None,
+        xmpp_debug=xmpp_debug,
     )
     dl = DownloadAgent(
         dl_jid, dl_pass,
         output_dir=output_dir,
         worker_slots=worker_slots,
         retries=retries,
+        use_xmpp=use_xmpp,
+        resilience_jid=res_jid if use_xmpp else None,
+        xmpp_debug=xmpp_debug,
     )
-    res = ResilienceAgent(res_jid, res_pass)
+    res = ResilienceAgent(
+        res_jid, res_pass,
+        use_xmpp=use_xmpp,
+        download_jid=dl_jid if use_xmpp else None,
+        xmpp_debug=xmpp_debug,
+    )
 
-    # ── START ─────────────────────────────────────────────────────────
+    # -- START ---------------------------------------------------------
     logger.info("Starting all agents...")
-    await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
-    await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
-    await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
+    if use_xmpp:
+        await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
+        await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
+        await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
+    else:
+        await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
+        await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
+        await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
 
-    # wire resilience to watch the others
-    res.watch("discovery", disc)
-    res.watch("download",  dl)
+    # wire resilience to watch the others (direct mode only)
+    if not use_xmpp:
+        res.watch("discovery", disc)
+        res.watch("download",  dl)
 
     logger.info("All agents running. Pipeline in progress...")
 
-    # ── DISCOVERY PHASE ───────────────────────────────────────────────
+    # -- DISCOVERY PHASE -----------------------------------------------
     logger.info("Waiting for Discovery to resolve inputs...")
     try:
         await asyncio.wait_for(disc.resolution_done.wait(), timeout=180)
@@ -96,41 +117,48 @@ async def run_pipeline(
         return
 
     jobs = disc.get_jobs()
-    logger.info("Discovery complete — %d jobs resolved", len(jobs))
+    logger.info("Discovery complete - %d jobs resolved", len(jobs))
 
-    if not jobs:
-        logger.warning("No jobs resolved — nothing to download")
-        await _stop_all(disc, dl, res)
-        return
+    if not use_xmpp:
+        if not jobs:
+            logger.warning("No jobs resolved - nothing to download")
+            await _stop_all(disc, dl, res)
+            return
 
-    # ── DOWNLOAD PHASE ────────────────────────────────────────────────
-    dl.add_jobs(jobs)
-    logger.info(
-        "Download started — %d jobs  workers:%d  retries:%d",
-        len(jobs), worker_slots, retries
-    )
+        # -- DOWNLOAD PHASE --------------------------------------------
+        dl.add_jobs(jobs)
+        logger.info(
+            "Download started - %d jobs  workers:%d  retries:%d",
+            len(jobs), worker_slots, retries
+        )
+    else:
+        logger.info(
+            "Download started - jobs dispatched via XMPP  workers:%d  retries:%d",
+            worker_slots, retries
+        )
 
     try:
         await asyncio.wait_for(dl.all_done_event.wait(), timeout=3600)
     except asyncio.TimeoutError:
         logger.error("Download timed out after 3600s")
 
-    # ── WRAP UP ───────────────────────────────────────────────────────
-    res.mark_done()
+    # -- WRAP UP -------------------------------------------------------
+    if not use_xmpp:
+        res.mark_done()
     await _stop_all(disc, dl, res)
 
-    # ── PRINT SUMMARY ─────────────────────────────────────────────────
+    # -- PRINT SUMMARY -------------------------------------------------
     ds = dl.download_state
     rs = res.resilience_state
 
-    print(f"\n{'═'*62}")
+    print(f"\n{'-'*62}")
     print(f"  PIPELINE COMPLETE")
-    print(f"{'═'*62}")
+    print(f"{'-'*62}")
     print(f"  Downloaded : {ds.done}  Errors: {ds.errors}  Total: {ds.total}")
     print(f"  Size       : {ds.total_mb} MB")
     print(f"  Retries    : {rs.retries}  Failures: {rs.failures}")
     print(f"  Output     : {Path(output_dir).resolve()}")
-    print(f"{'═'*62}\n")
+    print(f"{'-'*62}\n")
 
 
 async def _stop_all(*agents):
@@ -158,9 +186,9 @@ async def _start_agent_with_timeout(label: str, agent, timeout_s: float):
         raise
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(prog="agents.pipeline")
@@ -172,7 +200,7 @@ def parse_args():
                    help="Output directory")
     p.add_argument("-w", "--workers",
                    type=int, default=4,
-                   help=f"Worker slots (1–6, default 4)")
+                   help=f"Worker slots (1-6, default 4)")
     p.add_argument("-r", "--retries",
                    type=int, default=2,
                    help="Download retries per video")
@@ -185,6 +213,13 @@ def parse_args():
     p.add_argument("--playlist",
                    type=int, default=20,
                    help="Max videos per playlist")
+    p.add_argument("--mode",
+                   choices=["direct", "xmpp"],
+                   default="direct",
+                   help="Agent communication mode (direct or xmpp)")
+    p.add_argument("--xmpp-log",
+                   action="store_true",
+                   help="Log raw XMPP messages and stanza traffic")
     return p.parse_args()
 
 
@@ -196,9 +231,13 @@ def main():
 
     args = parse_args()
 
+    if args.xmpp_log:
+        logging.getLogger("slixmpp").setLevel(logging.DEBUG)
+        logging.getLogger("slixmpp.xmlstream").setLevel(logging.DEBUG)
+
     qfile = Path(args.input)
     if not qfile.exists():
-        sys.exit(f"❌  Input file not found: {qfile}")
+        sys.exit(f"?  Input file not found: {qfile}")
 
     max_items = {
         "search":   args.search,
@@ -215,6 +254,8 @@ def main():
             worker_slots = args.workers,
             retries      = args.retries,
             max_items    = max_items,
+            comm_mode    = args.mode,
+            xmpp_debug   = args.xmpp_log,
         ))
     finally:
         # cancel all remaining tasks so slixmpp reconnect loops die
@@ -226,7 +267,7 @@ def main():
                 asyncio.gather(*pending, return_exceptions=True)
             )
         loop.close()
-        # hard exit — don't let slixmpp's threads delay shutdown
+        # hard exit - don't let slixmpp's threads delay shutdown
         os._exit(0)
 
 

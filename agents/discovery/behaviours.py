@@ -115,6 +115,9 @@ class ResolveBehaviour(spade.behaviour.OneShotBehaviour):
         )
 
         # Signal the agent that resolution is finished
+
+        if agent.use_xmpp:
+            await self._send_discovery_done(total, skipped, errors)
         agent.resolution_done.set()
 
     # ── RESOLUTION HELPERS ────────────────────────────────────────────────
@@ -137,7 +140,9 @@ class ResolveBehaviour(spade.behaviour.OneShotBehaviour):
         # direct video URLs — no resolution needed
         for url in classified["direct"]:
             agent._log("[URL]", f"{url} → verified direct link")
-            agent._enqueue_job(url, "direct", url)
+            job = await agent._enqueue_job(url, "direct", url)
+            if agent.use_xmpp:
+                await self._send_job(job)
             with ds.lock:
                 ds.resolved["direct"] = ds.resolved.get("direct", 0) + 1
                 ds.total += 1
@@ -160,10 +165,12 @@ class ResolveBehaviour(spade.behaviour.OneShotBehaviour):
             for v in videos:
                 url = v.get("url")
                 if url:
-                    agent._enqueue_job(
+                    job = await agent._enqueue_job(
                         url, "search", query,
                         title=v.get("title", ""),
                     )
+                    if agent.use_xmpp:
+                        await self._send_job(job)
                     with ds.lock:
                         ds.resolved["search"] = ds.resolved.get("search", 0) + 1
                         ds.total += 1
@@ -198,10 +205,12 @@ class ResolveBehaviour(spade.behaviour.OneShotBehaviour):
             agent._log("[CHAN]", f"{name} → {len(urls)} URLs resolved")
 
             for video_url in urls:
-                agent._enqueue_job(video_url, "channel", url, title=name)
+                job = await agent._enqueue_job(video_url, "channel", url, title=name)
                 with ds.lock:
                     ds.resolved["channel"] = ds.resolved.get("channel", 0) + 1
                     ds.total += 1
+                if agent.use_xmpp:
+                    await self._send_job(job)
 
         except asyncio.TimeoutError:
             agent._log("[ERR]", f"{url} → channel fetch timed out after 30s")
@@ -233,10 +242,12 @@ class ResolveBehaviour(spade.behaviour.OneShotBehaviour):
             agent._log("[LIST]", f"{name} → {len(urls)} URLs resolved")
 
             for video_url in urls:
-                agent._enqueue_job(video_url, "playlist", url, title=name)
+                job = await agent._enqueue_job(video_url, "playlist", url, title=name)
                 with ds.lock:
                     ds.resolved["playlist"] = ds.resolved.get("playlist", 0) + 1
                     ds.total += 1
+                if agent.use_xmpp:
+                    await self._send_job(job)
 
         except asyncio.TimeoutError:
             agent._log("[WARN]", f"{url} → playlist fetch timed out after 30s — skipping")
@@ -247,3 +258,57 @@ class ResolveBehaviour(spade.behaviour.OneShotBehaviour):
             agent._log("[WARN]", f"{url} → {exc} — skipping")
             with ds.lock:
                 ds.skipped += 1
+
+    async def _send_job(self, job):
+        agent = self.agent
+        if not agent.download_jid:
+            return
+        try:
+            from spade.message import Message
+            from agents.shared.ontology import (
+                INFORM,
+                ONTOLOGY,
+                JobEnqueueMsg,
+                encode,
+            )
+            msg = Message(to=agent.download_jid)
+            msg.set_metadata("performative", INFORM)
+            msg.set_metadata("ontology", ONTOLOGY)
+            msg.body = encode(JobEnqueueMsg(
+                url=job.url,
+                source=job.source,
+                query_key=job.query_key,
+                title=job.title,
+                output_dir=job.output_dir,
+            ))
+            if agent.xmpp_debug:
+                logger.info("XMPP SEND job.enqueue -> %s | %s", agent.download_jid, msg.body)
+            await self.send(msg)
+        except Exception as exc:
+            logger.warning("Failed to send job via XMPP: %s", exc)
+
+    async def _send_discovery_done(self, total: int, skipped: int, errors: int):
+        agent = self.agent
+        if not agent.download_jid:
+            return
+        try:
+            from spade.message import Message
+            from agents.shared.ontology import (
+                INFORM,
+                ONTOLOGY,
+                DiscoveryDoneMsg,
+                encode,
+            )
+            msg = Message(to=agent.download_jid)
+            msg.set_metadata("performative", INFORM)
+            msg.set_metadata("ontology", ONTOLOGY)
+            msg.body = encode(DiscoveryDoneMsg(
+                total=total,
+                skipped=skipped,
+                errors=errors,
+            ))
+            if agent.xmpp_debug:
+                logger.info("XMPP SEND discovery.done -> %s | %s", agent.download_jid, msg.body)
+            await self.send(msg)
+        except Exception as exc:
+            logger.warning("Failed to send discovery.done via XMPP: %s", exc)
