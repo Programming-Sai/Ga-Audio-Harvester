@@ -63,7 +63,7 @@ async def run_pipeline(
 
     use_xmpp = comm_mode == "xmpp"
 
-    # -- CREATE --------------------------------------------------------
+    # ?? CREATE ????????????????????????????????????????????????????????
     disc = DiscoveryAgent(
         disc_jid, disc_pass,
         query_file=query_file,
@@ -89,84 +89,106 @@ async def run_pipeline(
         xmpp_debug=xmpp_debug,
     )
 
-    # -- START ---------------------------------------------------------
-    logger.info("Starting all agents...")
-    if use_xmpp:
-        await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
-        await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
-        await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
-    else:
-        await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
-        await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
-        await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
-
-    # wire resilience to watch the others (direct mode only)
-    if not use_xmpp:
-        res.watch("discovery", disc)
-        res.watch("download",  dl)
-
-    logger.info("All agents running. Pipeline in progress...")
-
-    # -- DISCOVERY PHASE -----------------------------------------------
-    logger.info("Waiting for Discovery to resolve inputs...")
+    completed = False
     try:
-        await asyncio.wait_for(disc.resolution_done.wait(), timeout=180)
-    except asyncio.TimeoutError:
-        logger.error("Discovery timed out after 180s")
-        await _stop_all(disc, dl, res)
-        return
+        # ?? START ?????????????????????????????????????????????????????????
+        logger.info("Starting all agents...")
+        if use_xmpp:
+            await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
+            await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
+            await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
+        else:
+            await _start_agent_with_timeout("DiscoveryAgent", disc, 15.0)
+            await _start_agent_with_timeout("DownloadAgent", dl, 15.0)
+            await _start_agent_with_timeout("ResilienceAgent", res, 15.0)
 
-    jobs = disc.get_jobs()
-    logger.info("Discovery complete - %d jobs resolved", len(jobs))
+        # wire resilience to watch the others (direct mode only)
+        if not use_xmpp:
+            res.watch("discovery", disc)
+            res.watch("download",  dl)
 
-    if not use_xmpp:
-        if not jobs:
-            logger.warning("No jobs resolved - nothing to download")
-            await _stop_all(disc, dl, res)
+        logger.info("All agents running. Pipeline in progress...")
+
+        # ?? DISCOVERY PHASE ???????????????????????????????????????????????
+        logger.info("Waiting for Discovery to resolve inputs...")
+        try:
+            await asyncio.wait_for(disc.resolution_done.wait(), timeout=180)
+        except asyncio.TimeoutError:
+            logger.error("Discovery timed out after 180s")
             return
 
-        # -- DOWNLOAD PHASE --------------------------------------------
-        dl.add_jobs(jobs)
-        logger.info(
-            "Download started - %d jobs  workers:%d  retries:%d",
-            len(jobs), worker_slots, retries
-        )
-    else:
-        logger.info(
-            "Download started - jobs dispatched via XMPP  workers:%d  retries:%d",
-            worker_slots, retries
-        )
+        jobs = disc.get_jobs()
+        logger.info("Discovery complete - %d jobs resolved", len(jobs))
 
-    try:
-        await asyncio.wait_for(dl.all_done_event.wait(), timeout=3600)
-    except asyncio.TimeoutError:
-        logger.error("Download timed out after 3600s")
+        if not use_xmpp:
+            if not jobs:
+                logger.warning("No jobs resolved - nothing to download")
+                return
 
-    # -- WRAP UP -------------------------------------------------------
-    if not use_xmpp:
-        res.mark_done()
-    await _stop_all(disc, dl, res)
+            # ?? DOWNLOAD PHASE ????????????????????????????????????????????
+            dl.add_jobs(jobs)
+            logger.info(
+                "Download started - %d jobs  workers:%d  retries:%d",
+                len(jobs), worker_slots, retries
+            )
+        else:
+            logger.info(
+                "Download started - jobs dispatched via XMPP  workers:%d  retries:%d",
+                worker_slots, retries
+            )
 
-    # -- PRINT SUMMARY -------------------------------------------------
-    ds = dl.download_state
-    rs = res.resilience_state
+        try:
+            await asyncio.wait_for(dl.all_done_event.wait(), timeout=3600)
+        except asyncio.TimeoutError:
+            logger.error("Download timed out after 3600s")
 
-    print(f"\n{'-'*62}")
-    print(f"  PIPELINE COMPLETE")
-    print(f"{'-'*62}")
-    print(f"  Downloaded : {ds.done}  Errors: {ds.errors}  Total: {ds.total}")
-    print(f"  Size       : {ds.total_mb} MB")
-    print(f"  Retries    : {rs.retries}  Failures: {rs.failures}")
-    print(f"  Output     : {Path(output_dir).resolve()}")
-    print(f"{'-'*62}\n")
+        # ?? WRAP UP ???????????????????????????????????????????????????????
+        if not use_xmpp:
+            res.mark_done()
 
+        completed = True
+    except KeyboardInterrupt:
+        logger.warning("Pipeline interrupted by user")
+    finally:
+        await _stop_all(disc, dl, res)
 
+        if completed:
+            # PRINT SUMMARY
+            ds = dl.download_state
+            rs = res.resilience_state
+
+            print("")
+            print("=" * 62)
+            print("  PIPELINE COMPLETE")
+            print("=" * 62)
+            print(f"  Downloaded : {ds.done}  Errors: {ds.errors}  Total: {ds.total}")
+            print(f"  Size       : {ds.total_mb} MB")
+            print(f"  Retries    : {rs.retries}  Failures: {rs.failures}")
+            print(f"  Output     : {Path(output_dir).resolve()}")
+            print("=" * 62)
 async def _stop_all(*agents):
     for a in agents:
         try:
+            # Best-effort: stop slixmpp reconnect/keepalive before closing loop
+            client = getattr(a, "client", None)
+            if client is not None:
+                try:
+                    client.auto_reconnect = False
+                except Exception:
+                    pass
+                try:
+                    client.reconnect = False
+                except Exception:
+                    pass
+                try:
+                    client.disconnect(wait=True)
+                except Exception:
+                    pass
             await asyncio.wait_for(a.stop(), timeout=3.0)
         except Exception:
             pass
+    # give transports a brief moment to flush disconnects
+    await asyncio.sleep(0.2)
 
 
 async def _start_agent_with_timeout(label: str, agent, timeout_s: float):
@@ -267,8 +289,6 @@ def main():
                 asyncio.gather(*pending, return_exceptions=True)
             )
         loop.close()
-        # hard exit - don't let slixmpp's threads delay shutdown
-        os._exit(0)
 
 
 if __name__ == "__main__":
