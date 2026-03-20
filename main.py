@@ -74,7 +74,7 @@ Examples:
     parser.add_argument(
         "--mode",
         choices=["direct", "xmpp"],
-        default="direct",
+        default="xmpp",
         help="Agent communication mode (direct or xmpp)"
     )
     parser.add_argument(

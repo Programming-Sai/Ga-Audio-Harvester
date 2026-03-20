@@ -39,7 +39,7 @@ async def run_pipeline(
     worker_slots: int        = 4,
     retries:      int        = 2,
     max_items:    dict       = None,
-    comm_mode:    str        = "direct",
+    comm_mode:    str        = "xmpp",
     xmpp_debug:   bool       = False,
 ):
     """
@@ -237,7 +237,7 @@ def parse_args():
                    help="Max videos per playlist")
     p.add_argument("--mode",
                    choices=["direct", "xmpp"],
-                   default="direct",
+                   default="xmpp",
                    help="Agent communication mode (direct or xmpp)")
     p.add_argument("--xmpp-log",
                    action="store_true",
