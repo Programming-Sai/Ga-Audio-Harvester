@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import spade.behaviour
+from spade.message import Message
 
 if TYPE_CHECKING:
     from .agent import DownloadAgent
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # how often the cyclic behaviour polls for new jobs (seconds)
 POLL_INTERVAL = 0.5
+XMPP_PROGRESS_PERIOD = 2.5  # seconds between progress publishes (XMPP mode)
 
 
 class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
@@ -85,6 +87,8 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
                     w.name   = ""
                     w.speed  = 0.0
                     w.job    = None  # clear job reference on slot release
+                if getattr(job, "url", ""):
+                    agent.active_urls.discard(job.url)
 
     def _acquire_slot(self, agent: DownloadAgent, job) -> int | None:
         """Return the index of the first idle worker slot, or None."""
@@ -95,6 +99,8 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
                     w.active = True
                     w.name   = job.title or job.url
                     w.job    = job   # store job on slot so ResilienceAgent can read it
+                    if getattr(job, "url", ""):
+                        agent.active_urls.add(job.url)
                     return i
         return None
 
@@ -124,6 +130,8 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
                     w.speed = raw_spd / (1024 * 1024) if raw_spd else w.speed
                 elif status == "finished":
                     w.pct   = 100.0
+                # track hook activity so XMPP progress can detect stale telemetry
+                agent.slot_last_hook[slot_idx] = time.time()
 
         # â”€â”€ RUN IN THREAD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         from download_layer.core import download_video
@@ -131,17 +139,36 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
         out_dir = Path(job.output_dir) if job.output_dir else agent.output_dir
 
         try:
-            ok = await asyncio.wait_for(
-                asyncio.to_thread(
-                    download_video,
-                    job.url,
-                    output_dir=out_dir,
-                    audio_only=True,
-                    event_callback=_progress,
-                    retries=agent.retries,
-                ),
-                timeout=300.0  # 5 min max per download
-            )
+            # Poll the thread future so XMPP-mode resilience can request a retry.
+            # Note: the underlying thread cannot be force-killed; this is best-effort.
+            fut = asyncio.create_task(asyncio.to_thread(
+                download_video,
+                job.url,
+                output_dir=out_dir,
+                audio_only=True,
+                event_callback=_progress,
+                retries=agent.retries,
+            ))
+            ok = None
+
+            def _silence_task(t: asyncio.Task):
+                try:
+                    t.result()
+                except Exception:
+                    return
+
+            while True:
+                done, _pending = await asyncio.wait({fut}, timeout=0.5)
+                if done:
+                    ok = bool(list(done)[0].result())
+                    break
+                if (time.time() - start) > 300.0:
+                    fut.add_done_callback(_silence_task)
+                    raise asyncio.TimeoutError()
+                if agent.use_xmpp and job.url in agent.cancel_requested:
+                    fut.add_done_callback(_silence_task)
+                    ok = False
+                    break
         except asyncio.TimeoutError:
             ok = False
             agent._log("[ERR]", f"[W{slot_idx+1}] timed out after 300s: {job.url[:50]}")
@@ -150,6 +177,14 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             agent._log("[ERR]", f"[W{slot_idx+1}] exception: {exc}")
 
         elapsed = time.time() - start
+
+        # If resilience requested a retry, treat this attempt as transient and re-queue
+        # the same job without incrementing totals/errors.
+        if agent.use_xmpp and job.url in agent.cancel_requested:
+            agent.cancel_requested.discard(job.url)
+            agent._log("[RETRY]", f"[W{slot_idx+1}] retry requested — re-queuing: {job.url[:50]}")
+            await agent.pending_queue.put(job)
+            return
 
         # â”€â”€ UPDATE STATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         with ds.lock:
@@ -221,7 +256,6 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
         if not agent.use_xmpp or not agent.resilience_jid:
             return
         try:
-            from spade.message import Message
             from agents.shared.ontology import INFORM, ONTOLOGY, encode
             msg = Message(to=agent.resilience_jid)
             msg.set_metadata("performative", INFORM)
@@ -232,6 +266,65 @@ class QueueConsumerBehaviour(spade.behaviour.CyclicBehaviour):
             await self.send(msg)
         except Exception as exc:
             logger.warning("Failed to send to Resilience via XMPP: %s", exc)
+
+
+class XmppProgressPublisherBehaviour(spade.behaviour.PeriodicBehaviour):
+    """
+    Periodically publishes per-worker progress to ResilienceAgent in XMPP mode.
+
+    This is throttled and designed to support ResilienceAgent stall detection
+    without flooding the server with stanzas.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_sent: dict[str, tuple[float, float]] = {}  # url -> (ts, pct)
+
+    async def run(self):
+        agent: DownloadAgent = self.agent
+        if not agent.use_xmpp or not agent.resilience_jid:
+            return
+
+        from agents.shared.ontology import INFORM, ONTOLOGY, DownloadProgressMsg, encode
+
+        now = time.time()
+        with agent.download_state.lock:
+            snap = []
+            for idx, w in enumerate(agent.download_state.workers):
+                if not w.active or not w.job:
+                    continue
+                url = getattr(w.job, "url", "") or ""
+                if not url:
+                    continue
+                hook_ts = float(agent.slot_last_hook.get(idx, 0.0) or 0.0)
+                snap.append((url, float(w.pct), float(w.speed), getattr(w.job, "title", "") or "", hook_ts))
+
+        for url, pct, speed_mb, title, hook_ts in snap:
+            last_ts, last_pct = self._last_sent.get(url, (0.0, -1.0))
+            if (now - last_ts) < XMPP_PROGRESS_PERIOD and pct == last_pct:
+                continue
+
+            self._last_sent[url] = (now, pct)
+            speed_bytes = speed_mb * 1024 * 1024  # schema expects bytes/s
+            # If we haven't seen a hook update for a while, treat speed as 0 to help stall detection.
+            if hook_ts and (now - hook_ts) > 8.0:
+                speed_bytes = 0.0
+            msg = Message(to=agent.resilience_jid)
+            msg.set_metadata("performative", INFORM)
+            msg.set_metadata("ontology", ONTOLOGY)
+            msg.body = encode(DownloadProgressMsg(
+                url=url,
+                pct=pct,
+                speed=speed_bytes,
+                eta=0.0,
+                filename=title,
+            ))
+            if agent.xmpp_debug:
+                logger.info("XMPP SEND progress -> %s | %s", agent.resilience_jid, msg.body)
+            try:
+                await self.send(msg)
+            except Exception as exc:
+                logger.warning("Failed to send progress via XMPP: %s", exc)
 
 
 class XmppInboxBehaviour(spade.behaviour.CyclicBehaviour):
@@ -249,6 +342,7 @@ class XmppInboxBehaviour(spade.behaviour.CyclicBehaviour):
             ONTOLOGY,
             MSG_JOB_ENQUEUE,
             MSG_DISCOVERY_DONE,
+            MSG_RETRY,
             decode,
         )
         if msg.get_metadata("ontology") != ONTOLOGY:
@@ -271,3 +365,23 @@ class XmppInboxBehaviour(spade.behaviour.CyclicBehaviour):
                 agent.add_job(job)
         elif mtype == MSG_DISCOVERY_DONE:
             agent.discovery_done_event.set()
+        elif mtype == MSG_RETRY:
+            url = body.get("url", "")
+            if not url:
+                return
+
+            # If currently active, mark cancel requested; QueueConsumerBehaviour will requeue.
+            if url in agent.active_urls:
+                agent.cancel_requested.add(url)
+                agent._log("[RETRY]", f"Resilience requested retry (active): {url[:50]}")
+                return
+
+            # Otherwise, requeue immediately using remembered metadata (no total increment).
+            job = agent.job_templates.get(url)
+            if job is None:
+                from agents.download.agent import DownloadJob
+                job = DownloadJob(url=url, source="retry", query_key=url, title="", output_dir="")
+                agent.job_templates[url] = job
+
+            await agent.pending_queue.put(job)
+            agent._log("[RETRY]", f"Resilience requested retry — queued: {url[:50]}")

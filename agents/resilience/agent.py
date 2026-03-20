@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from agents.resilience.behaviours import (
     HeartbeatBehaviour,
     StallDetectorBehaviour,
+    XmppStallDetectorBehaviour,
     HEARTBEAT_PERIOD,
     STALL_PERIOD,
 )
@@ -60,6 +61,15 @@ class ResilienceInternalState:
     slot_last_pct:     dict = field(default_factory=dict)
     slot_last_move:    dict = field(default_factory=dict)
     slot_stall_warned: set  = field(default_factory=set)
+
+    # per-url progress/stall tracking (used by XmppInboxBehaviour + XmppStallDetectorBehaviour)
+    url_last_pct:      dict = field(default_factory=dict)  # url -> last pct seen
+    url_last_move:     dict = field(default_factory=dict)  # url -> last time pct changed
+    url_last_update:   dict = field(default_factory=dict)  # url -> last time we received any progress/status
+    url_last_speed:    dict = field(default_factory=dict)  # url -> last speed (bytes/s) reported
+    url_stall_warned:  set  = field(default_factory=set)   # urls already warned (avoid spam)
+    url_retry_counts:  dict = field(default_factory=dict)  # url -> retry attempts issued
+    url_active:        set  = field(default_factory=set)   # urls currently considered "in progress"
 
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -111,6 +121,9 @@ class ResilienceAgent(spade.agent.Agent):
         if self.use_xmpp:
             from agents.resilience.behaviours import XmppInboxBehaviour
             self.add_behaviour(XmppInboxBehaviour())
+            # In XMPP mode we don't have shared-memory access to DownloadAgent's
+            # worker slots, so we detect stalls using DownloadProgress messages.
+            self.add_behaviour(XmppStallDetectorBehaviour(period=STALL_PERIOD))
         else:
             self.add_behaviour(HeartbeatBehaviour(period=HEARTBEAT_PERIOD))
             self.add_behaviour(StallDetectorBehaviour(period=STALL_PERIOD))

@@ -29,6 +29,7 @@ import time
 from typing import TYPE_CHECKING
 
 import spade.behaviour
+from spade.message import Message
 
 if TYPE_CHECKING:
     from .agent import ResilienceAgent
@@ -194,6 +195,8 @@ class XmppInboxBehaviour(spade.behaviour.CyclicBehaviour):
 
         from agents.shared.ontology import (
             ONTOLOGY,
+            MSG_DL_PROGRESS,
+            MSG_DL_STARTED,
             MSG_DL_FINISHED,
             MSG_DL_FAILED,
             MSG_DL_ALL_DONE,
@@ -208,12 +211,148 @@ class XmppInboxBehaviour(spade.behaviour.CyclicBehaviour):
         mtype = body.get("type")
         rs = agent.resilience_state
 
+        now = time.time()
+
+        if mtype in (MSG_DL_STARTED, MSG_DL_PROGRESS):
+            url = body.get("url", "")
+            if not url:
+                return
+
+            pct = float(body.get("pct", 0.0) or 0.0)
+            spd = float(body.get("speed", 0.0) or 0.0)
+            with rs.lock:
+                rs.url_active.add(url)
+                rs.url_last_update[url] = now
+                rs.url_last_speed[url] = spd
+                last_pct = float(rs.url_last_pct.get(url, -1))
+                if pct != last_pct:
+                    rs.url_last_pct[url] = pct
+                    rs.url_last_move[url] = now
+                    # progress means this URL is no longer in a "stalled" state
+                    rs.url_stall_warned.discard(url)
+            return
+
         if mtype == MSG_DL_FINISHED:
+            url = body.get("url", "")
+            with rs.lock:
+                rs.url_active.discard(url)
+                rs.url_stall_warned.discard(url)
             agent._log("[OK]", f"Finished: {body.get('url', '')[:50]}")
         elif mtype == MSG_DL_FAILED:
             with rs.lock:
                 rs.failures += 1
+                url = body.get("url", "")
+                rs.url_active.discard(url)
+                rs.url_stall_warned.discard(url)
             agent._log("[FAIL]", f"Failed: {body.get('url', '')[:50]}")
         elif mtype == MSG_DL_ALL_DONE:
             rs.state_flag = "done"
             agent._log("[DONE]", "Download agent reported all done")
+            with rs.lock:
+                rs.url_active.clear()
+                rs.url_stall_warned.clear()
+                rs.url_last_update.clear()
+                rs.url_last_speed.clear()
+                rs.url_last_move.clear()
+                rs.url_last_pct.clear()
+                rs.url_retry_counts.clear()
+
+
+class XmppStallDetectorBehaviour(spade.behaviour.PeriodicBehaviour):
+    """
+    XMPP-mode stall detector.
+
+    Uses DownloadProgress messages (download.progress) as percepts. We keep
+    (url -> last_pct, last_move_ts) in resilience_state. If pct hasn't changed
+    for STALL_THRESHOLD seconds, we ask DownloadAgent to retry via XMPP.
+
+    NOTE: In XMPP mode we cannot force-cancel yt-dlp reliably. The retry request
+    is best-effort and DownloadAgent decides how to handle it safely.
+    """
+
+    async def run(self):
+        agent: ResilienceAgent = self.agent
+        rs = agent.resilience_state
+
+        if not agent.use_xmpp or not agent.download_jid:
+            return
+
+        now = time.time()
+
+        # snapshot to keep lock held briefly
+        with rs.lock:
+            active = list(rs.url_active)
+            last_pct = dict(rs.url_last_pct)
+            last_move = dict(rs.url_last_move)
+            last_update = dict(getattr(rs, "url_last_update", {}))
+            last_speed = dict(getattr(rs, "url_last_speed", {}))
+            warned = set(rs.url_stall_warned)
+            retry_counts = dict(rs.url_retry_counts)
+
+        for url in active:
+            pct = float(last_pct.get(url, 0.0) or 0.0)
+            lm = float(last_move.get(url, now) or now)
+            stall_secs = now - lm
+            lu = float(last_update.get(url, now) or now)
+            secs_since_update = now - lu
+            spd = float(last_speed.get(url, 0.0) or 0.0)
+
+            # Avoid false positives: if we're still receiving frequent progress telemetry
+            # and the reported speed is non-zero, treat as healthy even if pct is slow.
+            if secs_since_update < STALL_THRESHOLD and spd > 0:
+                continue
+
+            # Stall if we haven't seen any telemetry recently, or if pct hasn't moved and speed is zero.
+            if secs_since_update < STALL_THRESHOLD and not (stall_secs >= STALL_THRESHOLD and spd <= 0):
+                continue
+            if url in warned:
+                continue
+
+            # mark warned early to avoid duplicate sends if this behaviour runs again quickly
+            with rs.lock:
+                rs.url_stall_warned.add(url)
+
+            attempts = int(retry_counts.get(url, 0))
+
+            if pct > 0 and attempts < MAX_RETRIES:
+                with rs.lock:
+                    rs.url_retry_counts[url] = attempts + 1
+                    rs.retries += 1
+
+                agent._log(
+                    "[RETRY]",
+                    f"XMPP stall >{STALL_THRESHOLD}s at {pct:.0f}% — requesting retry "
+                    f"(attempt {attempts + 1}/{MAX_RETRIES}): {url[:50]}"
+                )
+                await self._send_retry(url=url, reason=f"stall:{pct:.0f}%:{stall_secs:.0f}s")
+
+            elif pct > 0 and attempts >= MAX_RETRIES:
+                with rs.lock:
+                    rs.failures += 1
+                agent._log(
+                    "[FAIL]",
+                    f"XMPP stall — max retries ({MAX_RETRIES}) exhausted: {url[:50]}"
+                )
+
+            else:
+                # pct == 0 stall — likely permanent failure (403, removed, auth, etc.)
+                with rs.lock:
+                    rs.retries += 1
+                agent._log(
+                    "[SKIP]",
+                    f"XMPP stall at 0% — not retrying (likely 403/bad path): {url[:50]}"
+                )
+
+    async def _send_retry(self, url: str, reason: str):
+        agent: ResilienceAgent = self.agent
+        try:
+            from agents.shared.ontology import REQUEST, ONTOLOGY, RetryMsg, encode
+            msg = Message(to=agent.download_jid)
+            msg.set_metadata("performative", REQUEST)
+            msg.set_metadata("ontology", ONTOLOGY)
+            msg.body = encode(RetryMsg(url=url, reason=reason))
+            if agent.xmpp_debug:
+                logger.info("XMPP SEND %s -> %s | %s", "resilience.retry", agent.download_jid, msg.body)
+            await self.send(msg)
+        except Exception as exc:
+            logger.warning("Failed to send retry via XMPP: %s", exc)

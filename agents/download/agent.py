@@ -128,6 +128,12 @@ class DownloadAgent(spade.agent.Agent):
         # pause flag — checked by QueueConsumerBehaviour
         self.paused = False
 
+        # XMPP-mode control + job bookkeeping (also safe to keep in direct mode)
+        self.job_templates: dict[str, DownloadJob] = {}   # url -> last-seen job fields
+        self.active_urls: set[str] = set()                # urls currently assigned to a worker slot
+        self.cancel_requested: set[str] = set()           # urls resilience asked us to abandon + retry
+        self.slot_last_hook: dict[int, float] = {}        # slot_idx -> last time yt-dlp hook updated (best-effort)
+
         # internal state
         self.download_state = DownloadInternalState()
 
@@ -150,6 +156,8 @@ class DownloadAgent(spade.agent.Agent):
         if self.use_xmpp:
             from agents.download.behaviours import XmppInboxBehaviour
             self.add_behaviour(XmppInboxBehaviour())
+            from agents.download.behaviours import XmppProgressPublisherBehaviour
+            self.add_behaviour(XmppProgressPublisherBehaviour(period=2.5))
 
     # ── PUBLIC API ────────────────────────────────────────────────────────
 
@@ -158,6 +166,9 @@ class DownloadAgent(spade.agent.Agent):
         self.pending_queue.put_nowait(job)
         with self.download_state.lock:
             self.download_state.total += 1
+        if job and getattr(job, "url", ""):
+            # Remember latest job metadata so resilience.retry can requeue cleanly.
+            self.job_templates[job.url] = job
 
     def add_jobs(self, jobs: list):
         """Add multiple jobs at once."""
