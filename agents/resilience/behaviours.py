@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-STALL_THRESHOLD  = 15   # seconds without progress before acting
+STALL_THRESHOLD  = 30   # seconds without progress before acting
 HEARTBEAT_PERIOD = 10   # seconds between heartbeat checks
 STALL_PERIOD     = 5    # seconds between stall checks
 MAX_RETRIES      = 3    # maximum retries per job before giving up

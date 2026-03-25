@@ -1,6 +1,6 @@
-# Ga-Audio-Harvester
+# Youtube-Audio-Harvester
 
-Ga-Audio-Harvester is a multi-agent YouTube audio curator for Ga-language content. It blends an agentic pipeline (Discovery, Download, Resilience) with a practical CLI, making it useful for language-resource curation, experimental agent architectures, and reproducible academic work.
+Youtube-Audio-Harvester is a multi-agent YouTube audio curator for Ga-language content. It blends an agentic pipeline (Discovery, Download, Resilience) with a practical CLI, making it useful for language-resource curation, experimental agent architectures, and reproducible academic work.
 
 **Abstract**
 This project treats audio collection as a coordinated multi-agent system: one agent resolves inputs into actionable URLs, another executes downloads with bounded concurrency, and a watchdog agent monitors health and failure signals. The system accepts search queries, channels, playlists, and direct video URLs, then curates the resulting audio into a consistent output layout for downstream analysis or listening.
